@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -12,10 +11,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import dispatch
+from drift import distance_km as haversine_km
+from drift import elapsed_hours, project_probability_area
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "maritime_sar.db"
 ACTIVE_INCIDENT = {"reported", "coordinating", "recovering"}
 CLOSED_INCIDENT = {"closed", "cancelled", "duplicate"}
+# 仍然存活、会随再次推算被合并或转待复核的概率区域状态
+LIVE_DRIFT_STATUSES = ("planned", "pending_release")
 
 
 class DomainError(Exception):
@@ -26,15 +31,6 @@ class DomainError(Exception):
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    radius = 6371.0088
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * radius * math.asin(math.sqrt(a))
 
 
 def require_role(role: str, allowed: set[str], action: str) -> None:
@@ -124,6 +120,12 @@ class MaritimeSARService:
                     status TEXT NOT NULL DEFAULT 'planned',
                     assigned_asset_id INTEGER REFERENCES assets(id),
                     note TEXT NOT NULL DEFAULT '',
+                    origin TEXT NOT NULL DEFAULT 'manual',
+                    source_area_id INTEGER REFERENCES search_areas(id),
+                    merged_into INTEGER REFERENCES search_areas(id),
+                    hold_reason TEXT NOT NULL DEFAULT '',
+                    projected_at TEXT,
+                    elapsed_hours REAL,
                     version INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -165,6 +167,22 @@ class MaritimeSARService:
                 CREATE INDEX IF NOT EXISTS idx_timeline_incident ON timeline(incident_id, id);
                 """
             )
+            self._migrate_search_areas(conn)
+
+    def _migrate_search_areas(self, conn: sqlite3.Connection) -> None:
+        """为既有数据库补充漂移调度相关列。"""
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(search_areas)")}
+        additions = {
+            "origin": "ALTER TABLE search_areas ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'",
+            "source_area_id": "ALTER TABLE search_areas ADD COLUMN source_area_id INTEGER REFERENCES search_areas(id)",
+            "merged_into": "ALTER TABLE search_areas ADD COLUMN merged_into INTEGER REFERENCES search_areas(id)",
+            "hold_reason": "ALTER TABLE search_areas ADD COLUMN hold_reason TEXT NOT NULL DEFAULT ''",
+            "projected_at": "ALTER TABLE search_areas ADD COLUMN projected_at TEXT",
+            "elapsed_hours": "ALTER TABLE search_areas ADD COLUMN elapsed_hours REAL",
+        }
+        for column, ddl in additions.items():
+            if column not in columns:
+                conn.execute(ddl)
 
     def _audit(self, conn: sqlite3.Connection, incident_id: int | None, actor: str, action: str, details: dict[str, Any]) -> None:
         conn.execute(
@@ -286,8 +304,122 @@ class MaritimeSARService:
                 )
             except sqlite3.IntegrityError as exc:
                 raise DomainError("搜索区域编号已存在", 409) from exc
-            self._audit(conn, incident_id, actor, "area.created", {"area_id": cur.lastrowid, "code": code})
-            return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (cur.lastrowid,)).fetchone())
+            area_id = int(cur.lastrowid)
+            self._audit(conn, incident_id, actor, "area.created", {"area_id": area_id, "code": code})
+            self._reproject_areas(conn, actor, incident, kind_hint=kind, priority_hint=priority, source_area_id=area_id)
+            return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone())
+
+    def _reproject_areas(self, conn: sqlite3.Connection, actor: str, incident: sqlite3.Row,
+                         kind_hint: str | None = None, priority_hint: int = 2,
+                         source_area_id: int | None = None) -> dict[str, Any]:
+        """按事件经过时长和漂移参数推算新的概率区域，并维护合并与待放行。"""
+        now_dt = datetime.now(timezone.utc)
+        hours = elapsed_hours(incident["created_at"], now_dt)
+        proj = project_probability_area(
+            incident["latitude"], incident["longitude"], incident["uncertainty_km"],
+            incident["drift_direction"], incident["drift_speed_kn"], hours,
+        )
+        if not kind_hint:
+            row = conn.execute(
+                "SELECT kind FROM search_areas WHERE incident_id=? AND origin='manual' ORDER BY id DESC LIMIT 1",
+                (incident["id"],),
+            ).fetchone()
+            kind_hint = row["kind"] if row else "surface"
+        seq = conn.execute(
+            "SELECT COUNT(*) AS c FROM search_areas WHERE incident_id=? AND origin='drift'",
+            (incident["id"],),
+        ).fetchone()["c"] + 1
+        code = "PRJ-%d-%03d" % (incident["id"], seq)
+        now = utcnow()
+        cur = conn.execute(
+            """INSERT INTO search_areas(incident_id,code,kind,center_lat,center_lon,radius_km,priority,status,note,
+               origin,source_area_id,projected_at,elapsed_hours,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (incident["id"], code, kind_hint, proj["center_lat"], proj["center_lon"], proj["radius_km"],
+             priority_hint, "planned",
+             "漂移推算：事件发生后 %.2f 小时，漂移 %.1fkm" % (hours, proj["drift_distance_km"]),
+             "drift", source_area_id, now, round(hours, 4), now, now),
+        )
+        new_id = int(cur.lastrowid)
+        self._audit(conn, incident["id"], actor, "area.projected", {
+            "area_id": new_id, "code": code, "elapsed_hours": round(hours, 2),
+            "drift_distance_km": round(proj["drift_distance_km"], 2),
+            "center": [round(proj["center_lat"], 5), round(proj["center_lon"], 5)],
+            "radius_km": round(proj["radius_km"], 2),
+        })
+        circle = {"center_lat": proj["center_lat"], "center_lon": proj["center_lon"], "radius_km": proj["radius_km"]}
+        live = conn.execute(
+            """SELECT * FROM search_areas WHERE incident_id=? AND origin='drift' AND id<>?
+               AND status IN ('planned','pending_release') ORDER BY id""",
+            (incident["id"], new_id),
+        ).fetchall()
+        merged = False
+        for old in live:
+            old_circle = {"center_lat": old["center_lat"], "center_lon": old["center_lon"], "radius_km": old["radius_km"]}
+            if dispatch.circles_overlap(circle, old_circle):
+                circle = dispatch.merge_circles(circle, old_circle)
+                merged = True
+                conn.execute(
+                    "UPDATE search_areas SET status='merged',merged_into=?,version=version+1,updated_at=? WHERE id=?",
+                    (new_id, now, old["id"]),
+                )
+                self._audit(conn, incident["id"], actor, "area.merged",
+                            {"area_id": old["id"], "code": old["code"], "into": code})
+            else:
+                conn.execute(
+                    "UPDATE search_areas SET status='pending_review',version=version+1,updated_at=? WHERE id=?",
+                    (now, old["id"]),
+                )
+                self._audit(conn, incident["id"], actor, "area.superseded",
+                            {"area_id": old["id"], "code": old["code"], "by": code})
+        if merged:
+            conn.execute(
+                "UPDATE search_areas SET center_lat=?,center_lon=?,radius_km=?,version=version+1,updated_at=? WHERE id=?",
+                (circle["center_lat"], circle["center_lon"], circle["radius_km"], now, new_id),
+            )
+        assets = [dict(r) for r in conn.execute("SELECT * FROM assets").fetchall()]
+        misses = dispatch.unreachable_assets(assets, kind_hint, incident["sea_state"],
+                                             circle["center_lat"], circle["center_lon"])
+        if misses:
+            reason = dispatch.hold_reason_text(misses)
+            conn.execute(
+                "UPDATE search_areas SET status='pending_release',hold_reason=?,version=version+1,updated_at=? WHERE id=?",
+                (reason, now, new_id),
+            )
+            self._audit(conn, incident["id"], actor, "area.held",
+                        {"area_id": new_id, "code": code, "reason": reason, "unreachable": misses})
+        return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (new_id,)).fetchone())
+
+    def reproject_incident(self, actor: str, role: str, incident_id: int, kind: str | None = None) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator", "operator"}, "推算漂移概率区域")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            incident = conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
+            if not incident:
+                raise DomainError("事件不存在", 404)
+            if incident["status"] not in ACTIVE_INCIDENT:
+                raise DomainError("当前事件不能推算概率区域", 409)
+            return self._reproject_areas(conn, actor, incident, kind_hint=(kind or "").strip() or None)
+
+    def release_area(self, actor: str, role: str, area_id: int, note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "放行搜索区域")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            area = conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone()
+            if not area:
+                raise DomainError("搜索区域不存在", 404)
+            if area["status"] != "pending_release":
+                raise DomainError("仅待放行区域可以放行", 409)
+            conn.execute(
+                "UPDATE search_areas SET status='planned',version=version+1,updated_at=? WHERE id=?",
+                (utcnow(), area_id),
+            )
+            self._audit(conn, area["incident_id"], actor, "area.released",
+                        {"area_id": area_id, "code": area["code"], "note": note.strip(),
+                         "previous_hold": area["hold_reason"]})
+            return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone())
 
     def assign_area(self, actor: str, role: str, area_id: int, asset_id: int,
                     expected_asset_version: int | None = None) -> dict[str, Any]:
@@ -301,6 +433,10 @@ class MaritimeSARService:
                 raise DomainError("搜索区域或资源不存在", 404)
             if area["assigned_asset_id"] is not None:
                 raise DomainError("搜索区域已经分配", 409)
+            if area["status"] == "pending_release":
+                raise DomainError("搜索区域待放行，请先放行再分配", 409)
+            if area["status"] != "planned":
+                raise DomainError("当前状态的搜索区域不能分配", 409)
             incident = conn.execute("SELECT * FROM incidents WHERE id=?", (area["incident_id"],)).fetchone()
             if not incident or incident["status"] not in ACTIVE_INCIDENT:
                 raise DomainError("事件当前不可分配", 409)
@@ -469,7 +605,7 @@ class MaritimeSARService:
             if incident["version"] != int(expected_version):
                 raise DomainError("事件已变化，请刷新后重试", 409)
             active_area = conn.execute(
-                "SELECT COUNT(*) AS c FROM search_areas WHERE incident_id=? AND status IN ('planned','assigned','active')",
+                "SELECT COUNT(*) AS c FROM search_areas WHERE incident_id=? AND status IN ('planned','assigned','active','pending_release')",
                 (incident_id,),
             ).fetchone()["c"]
             if active_area and outcome != "false_alarm":
@@ -566,7 +702,8 @@ class MaritimeSARService:
         with self.connect() as conn:
             if conn.execute("SELECT COUNT(*) AS c FROM incidents").fetchone()["c"]:
                 return {"seeded": False, "reason": "已有数据"}
-        incident = self.create_incident("coord-demo", "coordinator", "SAR-2026-001", "远星号", 31.2, 122.5, 15.0, 3, "东海搜救中心", description="演示遇险事件")
+        incident = self.create_incident("coord-demo", "coordinator", "SAR-2026-001", "远星号", 31.2, 122.5, 15.0, 3, "东海搜救中心",
+                                        drift_direction=115.0, drift_speed_kn=1.8, description="演示遇险事件")
         self.add_asset("coord-demo", "coordinator", "海巡01", "vessel", ["surface", "night"], 31.0, 122.0, 22.0, 180.0, 6)
         self.add_asset("coord-demo", "coordinator", "救助直升机", "aircraft", ["air", "night"], 30.8, 122.1, 180.0, 260.0, 5)
         self.create_search_area("coord-demo", "coordinator", incident["id"], "AREA-A", "surface", 31.2, 122.5, 20.0, 1, "首要搜索区")
@@ -639,6 +776,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.add_asset(actor, role, **data)
             elif path == "/api/areas":
                 result = self.service.create_search_area(actor, role, **data)
+            elif path == "/api/incidents/reproject":
+                result = self.service.reproject_incident(actor, role, **data)
+            elif path == "/api/areas/release":
+                result = self.service.release_area(actor, role, **data)
             elif path == "/api/assignments":
                 result = self.service.assign_area(actor, role, **data)
             elif path == "/api/clues":

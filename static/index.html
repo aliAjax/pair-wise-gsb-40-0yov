@@ -1,8 +1,44 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>海上搜救协调</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px;color:#17324d}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #cbd8e3;padding:8px;text-align:left}th{background:#edf5fb}code{background:#f2f5f7;padding:2px 5px}.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px}</style>
-<h1>海上搜救协调</h1><div class="card">页面读取实时状态。业务写入通过 README 中的 JSON API 完成，并需要 <code>X-User</code>、<code>X-Role</code>。</div>
-<h2>遇险事件</h2><table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态</th><th>海况</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
+<style>
+body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:30px auto;padding:0 20px;color:#17324d}
+table{border-collapse:collapse;width:100%;margin:16px 0}
+th,td{border:1px solid #cbd8e3;padding:8px;text-align:left}
+th{background:#edf5fb}
+code{background:#f2f5f7;padding:2px 5px}
+.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px;margin:16px 0}
+.hold{background:#fff6ec;border-left:5px solid #e08a1e;padding:12px 16px;margin:16px 0}
+.hold ul{margin:6px 0 0}
+</style>
+<h1>海上搜救协调</h1>
+<div class="card">页面读取实时状态，刷新后推算结果、合并关系和待放行区域保持不变。保存搜索区域时按事件漂移参数（方向、速度）与经过时长自动推算概率区域；重叠的概率区域自动合并；推算中心超出资源航程的区域进入待放行并注明哪条资源够不着。业务写入通过 README 中的 JSON API 完成，并需要 <code>X-User</code>、<code>X-Role</code>。</div>
+<h2>遇险事件</h2><table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态</th><th>海况</th><th>漂移方向</th><th>漂移速度kn</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
 <h2>资源</h2><table id="assets"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>航程</th></tr></thead><tbody></tbody></table>
-<h2>搜索区域</h2><table id="areas"><thead><tr><th>编号</th><th>事件</th><th>状态</th><th>优先级</th><th>资源</th></tr></thead><tbody></tbody></table>
+<h2>搜索区域调度概览</h2><div id="summary" class="card"></div>
+<h2>待放行区域</h2><div id="holds" class="hold">无待放行区域</div>
+<h2>搜索区域</h2><table id="areas"><thead><tr><th>编号</th><th>事件</th><th>来源</th><th>类型</th><th>状态</th><th>中心</th><th>半径km</th><th>推算时长h</th><th>待放行原因</th><th>合并入</th><th>资源</th><th>说明</th></tr></thead><tbody></tbody></table>
 <h2>时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('')};fill('incidents',d.incidents,['code','vessel_name','status','sea_state','lead_org','version']);fill('assets',d.assets,['name','kind','status','range_km']);fill('areas',d.search_areas,['code','incident_id','status','priority','assigned_asset_id']);document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<script>
+const AREA_STATUS={planned:'已规划',assigned:'已分配',active:'执行中',pending_review:'待复核',pending_release:'待放行',merged:'已合并',completed:'已完成',abandoned:'已放弃'};
+const ORIGIN={manual:'人工圈定',drift:'漂移推算'};
+const f=(v,d=4)=>(v===null||v===undefined||v==='')?'':Number(v).toFixed(d);
+async function load(){
+  const d=await fetch('/api/state').then(r=>r.json());
+  const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('')};
+  fill('incidents',d.incidents,['code','vessel_name','status','sea_state','drift_direction','drift_speed_kn','lead_org','version']);
+  fill('assets',d.assets,['name','kind','status','range_km']);
+  const codeOf=id=>{const a=d.search_areas.find(x=>x.id===id);return a?a.code:(id??'')};
+  document.querySelector('#areas tbody').innerHTML=d.search_areas.map(r=>'<tr>'+[
+    r.code,r.incident_id,ORIGIN[r.origin]||r.origin||'人工圈定',r.kind,AREA_STATUS[r.status]||r.status,
+    f(r.center_lat)+','+f(r.center_lon),f(r.radius_km,1),
+    r.elapsed_hours===null||r.elapsed_hours===undefined?'':f(r.elapsed_hours,2),
+    r.hold_reason||'',r.merged_into?codeOf(r.merged_into):'',r.assigned_asset_id??'',r.note||''
+  ].map(c=>`<td>${c}</td>`).join('')+'</tr>').join('');
+  const by=s=>d.search_areas.filter(a=>a.status===s);
+  const drift=d.search_areas.filter(a=>a.origin==='drift');
+  document.querySelector('#summary').textContent=`漂移推算区域 ${drift.length} 个；已合并 ${by('merged').length} 个；待复核 ${by('pending_review').length} 个；待放行 ${by('pending_release').length} 个。`;
+  const holds=by('pending_release');
+  document.querySelector('#holds').innerHTML=holds.length?'<ul>'+holds.map(a=>`<li><b>${a.code}</b>（事件 ${a.incident_id}）：${a.hold_reason}</li>`).join('')+'</ul>':'无待放行区域';
+  document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('');
+}
+load()
+</script></html>
