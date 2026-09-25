@@ -24,7 +24,7 @@ class MaritimeSARFlowTest(unittest.TestCase):
     def test_complete_assignment_clue_offline_and_close_flow(self):
         area = self.service.create_search_area(
             "coord1", "coordinator", self.incident["id"], "A-01", "surface", 31.1, 122.1, 8, 1
-        )
+        )["probability_area"]
         assigned = self.service.assign_area("coord1", "coordinator", area["id"], self.asset["id"], self.asset["version"])
         self.assertEqual("assigned", assigned["status"])
         clue = self.service.record_clue(
@@ -40,7 +40,7 @@ class MaritimeSARFlowTest(unittest.TestCase):
         self.assertTrue(self.service.merge_offline_batch("field1", "field", "batch-1", [])["idempotent"])
         updated_asset = self.service.list_assets()[0]
         self.service.withdraw_asset("coord1", "coordinator", self.asset["id"], "任务移交", updated_asset["version"])
-        current_area = self.service.state()["search_areas"][0]
+        current_area = next(x for x in self.service.state()["search_areas"] if x["id"] == area["id"])
         self.service.complete_area("coord1", "coordinator", area["id"], "abandoned", current_area["version"])
         current_incident = [x for x in self.service.state()["incidents"] if x["id"] == self.incident["id"]][0]
         closed = self.service.close_incident("coord1", "coordinator", self.incident["id"], "resolved", current_incident["version"])
@@ -63,11 +63,11 @@ class MaritimeSARFlowTest(unittest.TestCase):
     def test_assignment_conflict_and_permission(self):
         area = self.service.create_search_area(
             "coord1", "coordinator", self.incident["id"], "A-02", "surface", 31.1, 122.1, 5
-        )
+        )["probability_area"]
         self.service.assign_area("coord1", "coordinator", area["id"], self.asset["id"], self.asset["version"])
         area2 = self.service.create_search_area(
             "coord1", "coordinator", self.incident["id"], "A-03", "surface", 31.2, 122.2, 5
-        )
+        )["probability_area"]
         with self.assertRaises(DomainError) as ctx:
             self.service.assign_area("coord1", "coordinator", area2["id"], self.asset["id"], self.asset["version"])
         self.assertEqual(409, ctx.exception.status)

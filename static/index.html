@@ -1,8 +1,143 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>海上搜救协调</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px;color:#17324d}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #cbd8e3;padding:8px;text-align:left}th{background:#edf5fb}code{background:#f2f5f7;padding:2px 5px}.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px}</style>
-<h1>海上搜救协调</h1><div class="card">页面读取实时状态。业务写入通过 README 中的 JSON API 完成，并需要 <code>X-User</code>、<code>X-Role</code>。</div>
-<h2>遇险事件</h2><table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态</th><th>海况</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
-<h2>资源</h2><table id="assets"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>航程</th></tr></thead><tbody></tbody></table>
-<h2>搜索区域</h2><table id="areas"><thead><tr><th>编号</th><th>事件</th><th>状态</th><th>优先级</th><th>资源</th></tr></thead><tbody></tbody></table>
-<h2>时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('')};fill('incidents',d.incidents,['code','vessel_name','status','sea_state','lead_org','version']);fill('assets',d.assets,['name','kind','status','range_km']);fill('areas',d.search_areas,['code','incident_id','status','priority','assigned_asset_id']);document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>海上搜救协调 · 漂移推算调度</title>
+<style>
+  body{font:14px/1.6 system-ui,sans-serif;max-width:1240px;margin:24px auto;padding:0 20px;color:#17324d}
+  h1{margin-bottom:4px}
+  h2{margin-top:32px;border-bottom:2px solid #d7e6f2;padding-bottom:6px}
+  .card{background:#f7fbfe;border-left:5px solid #2784c7;padding:10px 16px;margin:12px 0}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13px}
+  th,td{border:1px solid #cbd8e3;padding:6px 8px;text-align:left;vertical-align:top}
+  th{background:#edf5fb}
+  code{background:#f2f5f7;padding:2px 5px;border-radius:3px}
+  .badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;color:#fff;white-space:nowrap}
+  .b-planned{background:#2e8b57}
+  .b-pending_release{background:#c0392b}
+  .b-review{background:#b9770e}
+  .b-merged{background:#7f8c8d}
+  .b-assigned,.b-active{background:#2471a3}
+  .b-completed{background:#1e8449}
+  .b-abandoned{background:#922b21}
+  .ok{color:#2e8b57;font-weight:600}
+  .no{color:#c0392b;font-weight:600}
+  .muted{color:#6b7f90}
+  .gate{font-size:12px;margin:3px 0}
+  button{background:#2784c7;color:#fff;border:0;padding:7px 16px;border-radius:5px;cursor:pointer;font-size:14px}
+  button:hover{background:#1c6699}
+  #updated{margin-left:12px;color:#6b7f90;font-size:12px}
+</style>
+</head>
+<body>
+<h1>海上搜救协调 · 漂移推算调度</h1>
+<div class="card">
+  人手圈定区域保存后，系统按<b>事件发生至今的时长 × 漂移方向/速度</b>推算概率区域（中心平移、半径发散），
+  旧圈定区转<b>待复核</b>；同一事件、同一搜索类型的概率区域重叠即合并；推算后中心超出所有在册资源航程的概率区
+  留在<b>待放行</b>，并注明哪条资源够不着。推算结果、合并关系与放行判断均已持久化，重开页面继续可见。
+  业务写入通过 JSON API（需 <code>X-User</code> / <code>X-Role</code>）完成，本页只读。
+</div>
+<button id="refresh">刷新推算视图</button><span id="updated"></span>
+
+<h2>遇险事件（漂移参数）</h2>
+<table id="incidents"><thead><tr>
+  <th>编号</th><th>船名</th><th>状态</th><th>海况</th><th>漂移方向(°)</th><th>漂移速度(节)</th><th>负责机构</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>概率搜索区域（推算 / 放行）</h2>
+<table id="areas"><thead><tr>
+  <th>编号</th><th>事件</th><th>类型</th><th>状态</th><th>中心</th><th>半径(km)</th>
+  <th>漂移推算</th><th>来源 / 合并</th><th>航程放行门控</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>待复核的旧区域（原人手圈定）</h2>
+<table id="manuals"><thead><tr>
+  <th>编号</th><th>事件</th><th>类型</th><th>中心</th><th>半径(km)</th><th>优先级</th><th>备注</th><th>登记时间</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>合并关系（重叠概率区）</h2>
+<table id="merges"><thead><tr>
+  <th>#</th><th>事件</th><th>源概率区</th><th>合并后区域</th><th>合并中心</th><th>半径(km)</th><th>时间</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>时间线（最近 20 条）</h2>
+<ol id="timeline"></ol>
+
+<script>
+const STATUS_TEXT = {
+  planned:'可放行', pending_release:'待放行', review:'待复核', merged:'已合并',
+  assigned:'已分配', active:'执行中', completed:'已完成', abandoned:'已放弃'
+};
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt = (v, d=2) => (v === null || v === undefined) ? '' : Number(v).toFixed(d);
+
+function badge(status){
+  return `<span class="badge b-${esc(status)}">${esc(STATUS_TEXT[status] || status)}</span>`;
+}
+
+async function load(){
+  const d = await fetch('/api/state').then(r => r.json());
+  const incById = Object.fromEntries(d.incidents.map(i => [i.id, i]));
+  const areaById = Object.fromEntries(d.search_areas.map(a => [a.id, a]));
+
+  // 事件
+  document.querySelector('#incidents tbody').innerHTML = d.incidents.map(i =>
+    `<tr><td>${esc(i.code)}</td><td>${esc(i.vessel_name)}</td><td>${esc(i.status)}</td>` +
+    `<td>${esc(i.sea_state)}</td><td>${fmt(i.drift_direction,0)}</td><td>${fmt(i.drift_speed_kn,1)}</td>` +
+    `<td>${esc(i.lead_org)}</td></tr>`).join('');
+
+  // 概率区域
+  const probs = d.search_areas.filter(a => a.area_role === 'probability');
+  document.querySelector('#areas tbody').innerHTML = probs.map(a => {
+    const drift = a.elapsed_hours === null ? '<span class="muted">—</span>' :
+      `方向 ${fmt(a.drift_direction,0)}° / ${fmt(a.drift_speed_kn,1)} 节<br>` +
+      `耗时 ${fmt(a.elapsed_hours,1)} h，漂移 ${fmt(a.drift_distance_km,1)} km`;
+    let src = a.parent_area_id
+      ? `源自 <code>${esc((areaById[a.parent_area_id]||{}).code || a.parent_area_id)}</code>`
+      : '<span class="muted">合并生成</span>';
+    if (a.merged_into_id) src += `<br>已并入 <code>${esc((areaById[a.merged_into_id]||{}).code || a.merged_into_id)}</code>`;
+    if (a.note) src += `<br><span class="muted">${esc(a.note)}</span>`;
+    const checks = (a.gate_checks || []);
+    let gate;
+    if (!checks.length) gate = '<span class="muted">—</span>';
+    else {
+      gate = checks.map(g =>
+        `<div class="gate"><span class="${g.reachable ? 'ok' : 'no'}">${g.reachable ? '够得着' : '够不着'}</span> ` +
+        `${esc(g.asset_name)}：距中心 ${fmt(g.distance_km,1)} / 航程 ${fmt(g.range_km,1)} km` +
+        (g.reachable ? '' : ` <b>差 ${fmt(g.shortfall_km,1)} km</b>`) + `</div>`).join('');
+      if (a.status === 'pending_release' && a.gate_reason) gate += `<div class="no">${esc(a.gate_reason)}</div>`;
+    }
+    return `<tr><td><code>${esc(a.code)}</code></td><td>#${a.incident_id} ${esc((incById[a.incident_id]||{}).code || '')}</td>` +
+      `<td>${esc(a.kind)}</td><td>${badge(a.status)}</td>` +
+      `<td>${fmt(a.center_lat,3)}, ${fmt(a.center_lon,3)}</td><td>${fmt(a.radius_km,1)}</td>` +
+      `<td>${drift}</td><td>${src}</td><td>${gate}</td></tr>`;
+  }).join('');
+
+  // 手工/待复核旧区域
+  const manuals = d.search_areas.filter(a => a.area_role === 'manual');
+  document.querySelector('#manuals tbody').innerHTML = manuals.length ? manuals.map(a =>
+    `<tr><td><code>${esc(a.code)}</code></td><td>#${a.incident_id}</td><td>${esc(a.kind)}</td>` +
+    `<td>${fmt(a.center_lat,3)}, ${fmt(a.center_lon,3)}</td><td>${fmt(a.radius_km,1)}</td>` +
+    `<td>${esc(a.priority)}</td><td>${esc(a.note)}</td><td class="muted">${esc(a.created_at)}</td></tr>`).join('')
+    : '<tr><td colspan="8" class="muted">暂无待复核旧区域</td></tr>';
+
+  // 合并关系
+  document.querySelector('#merges tbody').innerHTML = d.area_merges.length ? d.area_merges.map((m, idx) =>
+    `<tr><td>${idx + 1}</td><td>#${m.incident_id}</td>` +
+    `<td>${m.source_codes.map(c => `<code>${esc(c)}</code>`).join(' + ')}</td>` +
+    `<td><code>${esc((areaById[m.merged_area_id]||{}).code || m.merged_area_id)}</code> ${badge((areaById[m.merged_area_id]||{}).status || '')}</td>` +
+    `<td>${fmt(m.center_lat,3)}, ${fmt(m.center_lon,3)}</td><td>${fmt(m.radius_km,1)}</td>` +
+    `<td class="muted">${esc(m.created_at)}</td></tr>`).join('')
+    : '<tr><td colspan="7" class="muted">暂无合并记录</td></tr>';
+
+  // 时间线
+  document.querySelector('#timeline').innerHTML = d.timeline.slice(0, 20).map(x =>
+    `<li><span class="muted">${esc(x.created_at)}</span> <b>${esc(x.action)}</b> ${esc(x.details)}</li>`).join('');
+  document.querySelector('#updated').textContent = '更新于 ' + new Date().toLocaleTimeString();
+}
+
+document.querySelector('#refresh').addEventListener('click', load);
+load();
+</script>
+</body>
+</html>

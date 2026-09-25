@@ -1,21 +1,57 @@
-"""Maritime search-and-rescue coordination service."""
+"""Maritime search-and-rescue coordination service.
+
+分层：
+- drift.py       漂移推算（纯计算）
+- scheduling.py  调度规则：重叠合并、航程放行门控（纯规则）
+- app.py         持久化、编排与 HTTP 接口（本文件）
+- static/        只读页面
+"""
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from drift import elapsed_hours, haversine_km, project
+from scheduling import (
+    ACTIVE,
+    ASSIGNED,
+    Circle,
+    GateCheck,
+    MERGEABLE_STATUS,
+    PENDING_RELEASE,
+    REVIEW,
+    circles_overlap,
+    evaluate_release_gate,
+    merge_circles,
+    merge_priority,
+)
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "maritime_sar.db"
 ACTIVE_INCIDENT = {"reported", "coordinating", "recovering"}
 CLOSED_INCIDENT = {"closed", "cancelled", "duplicate"}
+
+# search_areas 表的增量列（供旧库迁移）
+AREA_ADDED_COLUMNS = [
+    "area_role TEXT NOT NULL DEFAULT 'probability'",  # manual=人手圈定, probability=推算概率区
+    "parent_area_id INTEGER REFERENCES search_areas(id)",  # 概率区来源的手工/旧区域
+    "merged_into_id INTEGER REFERENCES search_areas(id)",  # 已并入的目标概率区
+    "projected_at TEXT",
+    "elapsed_hours REAL",
+    "drift_direction REAL",
+    "drift_speed_kn REAL",
+    "drift_distance_km REAL",
+    "source_radius_km REAL",
+    "gate_reason TEXT NOT NULL DEFAULT ''",
+]
 
 
 class DomainError(Exception):
@@ -26,15 +62,6 @@ class DomainError(Exception):
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    radius = 6371.0088
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * radius * math.asin(math.sqrt(a))
 
 
 def require_role(role: str, allowed: set[str], action: str) -> None:
@@ -161,10 +188,41 @@ class MaritimeSARService:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS area_merges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    incident_id INTEGER NOT NULL REFERENCES incidents(id),
+                    merged_area_id INTEGER NOT NULL REFERENCES search_areas(id),
+                    source_area_ids TEXT NOT NULL,
+                    source_codes TEXT NOT NULL,
+                    center_lat REAL NOT NULL,
+                    center_lon REAL NOT NULL,
+                    radius_km REAL NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS area_gate_checks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    area_id INTEGER NOT NULL REFERENCES search_areas(id),
+                    incident_id INTEGER NOT NULL REFERENCES incidents(id),
+                    asset_id INTEGER NOT NULL REFERENCES assets(id),
+                    asset_name TEXT NOT NULL,
+                    distance_km REAL NOT NULL,
+                    range_km REAL NOT NULL,
+                    shortfall_km REAL NOT NULL DEFAULT 0,
+                    reachable INTEGER NOT NULL,
+                    checked_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_clues_incident ON clues(incident_id, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_timeline_incident ON timeline(incident_id, id);
+                CREATE INDEX IF NOT EXISTS idx_areas_incident ON search_areas(incident_id, status);
+                CREATE INDEX IF NOT EXISTS idx_merges_incident ON area_merges(incident_id, id);
+                CREATE INDEX IF NOT EXISTS idx_gates_area ON area_gate_checks(area_id, id);
                 """
             )
+            existing = {row["name"] for row in conn.execute("PRAGMA table_info(search_areas)").fetchall()}
+            for ddl in AREA_ADDED_COLUMNS:
+                column = ddl.split()[0]
+                if column not in existing:
+                    conn.execute("ALTER TABLE search_areas ADD COLUMN %s" % ddl)
 
     def _audit(self, conn: sqlite3.Connection, incident_id: int | None, actor: str, action: str, details: dict[str, Any]) -> None:
         conn.execute(
@@ -255,9 +313,27 @@ class MaritimeSARService:
             self._audit(conn, None, actor, "asset.registered", {"asset_id": cur.lastrowid, "name": name})
             return dict(conn.execute("SELECT * FROM assets WHERE id=?", (cur.lastrowid,)).fetchone())
 
+    # ------------------------------------------------------------------
+    # 搜索区域：保存即“按漂移推算调度”
+    # ------------------------------------------------------------------
+
+    def _probability_code(self, conn: sqlite3.Connection, incident_id: int) -> str:
+        while True:
+            code = "P-%d-%s" % (incident_id, uuid.uuid4().hex[:8])
+            if not conn.execute("SELECT 1 FROM search_areas WHERE code=?", (code,)).fetchone():
+                return code
+
     def create_search_area(self, actor: str, role: str, incident_id: int, code: str,
                            kind: str, center_lat: float, center_lon: float,
                            radius_km: float, priority: int = 3, note: str = "") -> dict[str, Any]:
+        """登记人手圈定区域并保存。
+
+        保存即按调度规则重算：
+        1. 手工圈定区域登记为所属事件的旧区域，转“待复核”；
+        2. 按事件发生至今的时长 + 漂移方向/速度推算中心和半径，生成概率区域；
+        3. 与同事件、同搜索类型的现有概率区域比较，重叠则合并；
+        4. 航程门控：存在够得着的资源则“可放行”，否则“待放行”并记清缺口。
+        """
         actor = clean_actor(actor)
         require_role(role, {"coordinator"}, "创建搜索区域")
         lat, lon = validate_position(center_lat, center_lon)
@@ -280,14 +356,160 @@ class MaritimeSARService:
                 raise DomainError("当前事件不能创建搜索区域", 409)
             try:
                 cur = conn.execute(
-                    """INSERT INTO search_areas(incident_id,code,kind,center_lat,center_lon,radius_km,priority,note,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                    (incident_id, code, kind, lat, lon, radius_km, priority, note.strip(), now, now),
+                    """INSERT INTO search_areas(incident_id,code,kind,center_lat,center_lon,radius_km,priority,status,
+                          note,area_role,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?, 'review',?, 'manual',?,?)""",
+                    (incident_id, code, kind, lat, lon, radius_km, priority,
+                     note.strip(), now, now),
                 )
             except sqlite3.IntegrityError as exc:
                 raise DomainError("搜索区域编号已存在", 409) from exc
-            self._audit(conn, incident_id, actor, "area.created", {"area_id": cur.lastrowid, "code": code})
-            return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (cur.lastrowid,)).fetchone())
+            manual_id = int(cur.lastrowid)
+            self._audit(conn, incident_id, actor, "area.created",
+                        {"area_id": manual_id, "code": code, "area_role": "manual", "next_status": REVIEW})
+
+            # 1) 漂移推算：事件发生到保存时刻经过的时长
+            hours = elapsed_hours(incident["created_at"], now)
+            projection = project(
+                lat, lon, radius_km,
+                incident["drift_direction"], incident["drift_speed_kn"], hours,
+            )
+            prob = self._persist_probability_area(
+                conn, incident, kind, Circle(projection.center_lat, projection.center_lon, projection.radius_km),
+                priority, now, parent_area_id=manual_id, note=note.strip(),
+                meta=projection.as_dict(), source_radius=radius_km,
+            )
+            self._audit(conn, incident_id, actor, "area.projected", {
+                "area_id": prob["id"], "code": prob["code"], "source_area_id": manual_id,
+                "projection": projection.as_dict(),
+            })
+
+            # 2) 同事件同类型概率区域重叠则合并（合并结果继续参与合并）
+            prob, merges = self._merge_overlapping_areas(conn, incident, prob, now, actor)
+
+            # 3) 航程放行门控
+            prob, gate = self._apply_release_gate(conn, incident, prob, now, actor)
+
+            manual = dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (manual_id,)).fetchone())
+            return {
+                "saved_area": manual,
+                "probability_area": prob,
+                "incident_id": incident_id,
+                "projection": projection.as_dict(),
+                "merges": merges,
+                "gate": {"status": gate.status, "reachable": gate.reachable, "details": gate.details},
+            }
+
+    def _persist_probability_area(self, conn: sqlite3.Connection, incident: sqlite3.Row,
+                                  kind: str, circle: Circle, priority: int, now: str,
+                                  parent_area_id: int | None, note: str,
+                                  meta: dict[str, Any] | None,
+                                  source_radius: float | None) -> dict[str, Any]:
+        code = self._probability_code(conn, incident["id"])
+        cur = conn.execute(
+            """INSERT INTO search_areas(incident_id,code,kind,center_lat,center_lon,radius_km,priority,status,
+                  note,area_role,parent_area_id,projected_at,elapsed_hours,drift_direction,drift_speed_kn,
+                  drift_distance_km,source_radius_km,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?, 'planned',?, 'probability',?,?,?,?,?,?,?,?,?)""",
+            (incident["id"], code, kind, circle.center_lat, circle.center_lon, circle.radius_km,
+             priority, note, parent_area_id, now,
+             (meta or {}).get("elapsed_hours"), (meta or {}).get("bearing_deg"),
+             (meta or {}).get("speed_kn"), (meta or {}).get("drift_distance_km"),
+             source_radius, now, now),
+        )
+        return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def _merge_overlapping_areas(self, conn: sqlite3.Connection, incident: sqlite3.Row,
+                                 area: dict[str, Any], now: str,
+                                 actor: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        merges: list[dict[str, Any]] = []
+        placeholders = ",".join("?" for _ in MERGEABLE_STATUS)
+        while True:
+            others = conn.execute(
+                """SELECT * FROM search_areas
+                   WHERE incident_id=? AND id<>? AND area_role='probability' AND kind=?
+                     AND status IN (%s)
+                   ORDER BY id""" % placeholders,
+                (incident["id"], area["id"], area["kind"], *MERGEABLE_STATUS),
+            ).fetchall()
+            overlap_row = None
+            current = Circle(area["center_lat"], area["center_lon"], area["radius_km"])
+            for row in others:
+                if circles_overlap(current, Circle(row["center_lat"], row["center_lon"], row["radius_km"])):
+                    overlap_row = row
+                    break
+            if overlap_row is None:
+                break
+            other_circle = Circle(overlap_row["center_lat"], overlap_row["center_lon"], overlap_row["radius_km"])
+            merged = merge_circles(current, other_circle)
+            priority = merge_priority([int(area["priority"]), int(overlap_row["priority"])])
+            note = "合并自 %s、%s" % (area["code"], overlap_row["code"])
+            new_area = self._persist_probability_area(
+                conn, incident, area["kind"], merged, priority, now, parent_area_id=None, note=note,
+                meta={"elapsed_hours": area["elapsed_hours"], "bearing_deg": area["drift_direction"],
+                      "speed_kn": area["drift_speed_kn"], "drift_distance_km": area["drift_distance_km"]},
+                source_radius=None,
+            )
+            conn.execute(
+                "UPDATE search_areas SET status='merged',merged_into_id=?,version=version+1,updated_at=? WHERE id IN (?,?)",
+                (new_area["id"], now, area["id"], overlap_row["id"]),
+            )
+            source_ids = [area["id"], overlap_row["id"]]
+            source_codes = [area["code"], overlap_row["code"]]
+            conn.execute(
+                """INSERT INTO area_merges(incident_id,merged_area_id,source_area_ids,source_codes,
+                       center_lat,center_lon,radius_km,created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (incident["id"], new_area["id"], json_dump(source_ids), json_dump(source_codes),
+                 merged.center_lat, merged.center_lon, merged.radius_km, now),
+            )
+            merge_record = {
+                "merged_area_id": new_area["id"], "merged_code": new_area["code"],
+                "source_area_ids": source_ids, "source_codes": source_codes,
+                "center_lat": merged.center_lat, "center_lon": merged.center_lon,
+                "radius_km": merged.radius_km,
+            }
+            merges.append(merge_record)
+            self._audit(conn, incident["id"], actor, "area.merged", merge_record)
+            area = new_area
+        return area, merges
+
+    def _apply_release_gate(self, conn: sqlite3.Connection, incident: sqlite3.Row,
+                            area: dict[str, Any], now: str, actor: str) -> tuple[dict[str, Any], GateCheck]:
+        assets = [dict(row) for row in conn.execute("SELECT * FROM assets ORDER BY id").fetchall()]
+        circle = Circle(area["center_lat"], area["center_lon"], area["radius_km"])
+        gate = evaluate_release_gate(circle, area["kind"], incident["sea_state"], assets)
+        conn.execute("DELETE FROM area_gate_checks WHERE area_id=?", (area["id"],))
+        for item in gate.details:
+            conn.execute(
+                """INSERT INTO area_gate_checks(area_id,incident_id,asset_id,asset_name,distance_km,range_km,
+                       shortfall_km,reachable,checked_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (area["id"], incident["id"], item["asset_id"], item["asset_name"],
+                 item["distance_km"], item["range_km"], item["shortfall_km"],
+                 1 if item["reachable"] else 0, now),
+            )
+        if gate.reachable:
+            reason = ""
+        elif not gate.details:
+            reason = "待放行：没有具备“%s”能力且适航海况 %s 的资源" % (area["kind"], incident["sea_state"])
+        else:
+            reason = "待放行：以下具备能力的资源均够不着：" + "；".join(
+                "%s（差 %.1f 公里）" % (item["asset_name"], item["shortfall_km"])
+                for item in gate.details if not item["reachable"]
+            )
+        conn.execute(
+            "UPDATE search_areas SET status=?,gate_reason=?,version=version+1,updated_at=? WHERE id=?",
+            (gate.status, reason, now, area["id"]),
+        )
+        self._audit(conn, incident["id"], actor, "area.release_gate", {
+            "area_id": area["id"], "code": area["code"], "status": gate.status,
+            "reachable": gate.reachable,
+            "reachable_assets": [d["asset_name"] for d in gate.details if d["reachable"]],
+            "unreachable_assets": gate.unreachable_assets(),
+            "reason": reason,
+        })
+        area = dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area["id"],)).fetchone())
+        return area, gate
 
     def assign_area(self, actor: str, role: str, area_id: int, asset_id: int,
                     expected_asset_version: int | None = None) -> dict[str, Any]:
@@ -299,8 +521,18 @@ class MaritimeSARService:
             asset = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
             if not area or not asset:
                 raise DomainError("搜索区域或资源不存在", 404)
-            if area["assigned_asset_id"] is not None:
+            if area["area_role"] != "probability":
+                raise DomainError("待复核的人手圈定区域不能直接分配，请对其概率区域调度", 409)
+            if area["status"] == "merged":
+                raise DomainError("该概率区域已并入 %s，不能分配" % self._code_of(conn, area["merged_into_id"]), 409)
+            if area["status"] == REVIEW:
+                raise DomainError("该区域为待复核旧区域，不能分配", 409)
+            if area["status"] == PENDING_RELEASE:
+                raise DomainError(area["gate_reason"] or "概率区域超出资源航程，待放行", 409)
+            if area["assigned_asset_id"] is not None or area["status"] in (ASSIGNED, ACTIVE):
                 raise DomainError("搜索区域已经分配", 409)
+            if area["status"] in {"completed", "abandoned"}:
+                raise DomainError("搜索区域已经结束", 409)
             incident = conn.execute("SELECT * FROM incidents WHERE id=?", (area["incident_id"],)).fetchone()
             if not incident or incident["status"] not in ACTIVE_INCIDENT:
                 raise DomainError("事件当前不可分配", 409)
@@ -329,6 +561,13 @@ class MaritimeSARService:
             )
             self._audit(conn, area["incident_id"], actor, "area.assigned", {"area_id": area_id, "asset_id": asset_id, "distance_km": round(distance, 2)})
             return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone())
+
+    @staticmethod
+    def _code_of(conn: sqlite3.Connection, area_id: int | None) -> str:
+        if area_id is None:
+            return "其他区域"
+        row = conn.execute("SELECT code FROM search_areas WHERE id=?", (area_id,)).fetchone()
+        return row["code"] if row else "其他区域"
 
     def record_clue(self, actor: str, role: str, incident_id: int, client_event_id: str,
                     latitude: float, longitude: float, confidence: float, source: str,
@@ -447,6 +686,8 @@ class MaritimeSARService:
                 raise DomainError("搜索区域不存在", 404)
             if area["status"] in {"completed", "abandoned"}:
                 raise DomainError("搜索区域已经结束", 409)
+            if area["status"] in {REVIEW, "merged"}:
+                raise DomainError("待复核或已合并区域不能直接结束", 409)
             if expected_version is not None and area["version"] != int(expected_version):
                 raise DomainError("搜索区域已变化，请刷新后重试", 409)
             if area["assigned_asset_id"] is not None:
@@ -469,11 +710,11 @@ class MaritimeSARService:
             if incident["version"] != int(expected_version):
                 raise DomainError("事件已变化，请刷新后重试", 409)
             active_area = conn.execute(
-                "SELECT COUNT(*) AS c FROM search_areas WHERE incident_id=? AND status IN ('planned','assigned','active')",
+                "SELECT COUNT(*) AS c FROM search_areas WHERE incident_id=? AND status IN ('planned','pending_release','assigned','active')",
                 (incident_id,),
             ).fetchone()["c"]
             if active_area and outcome != "false_alarm":
-                raise DomainError("仍有未结束搜索区域，不能关闭事件", 409)
+                raise DomainError("仍有可放行/待放行或执行中的搜索区域，不能关闭事件", 409)
             status = "closed" if outcome == "resolved" else "cancelled"
             conn.execute("UPDATE incidents SET status=?,version=version+1,updated_at=? WHERE id=?", (status, utcnow(), incident_id))
             self._audit(conn, incident_id, actor, "incident.closed", {"outcome": outcome})
@@ -555,7 +796,22 @@ class MaritimeSARService:
             clues = [dict(r) for r in conn.execute("SELECT * FROM clues ORDER BY id DESC LIMIT 200").fetchall()]
             assets = [dict(r) for r in conn.execute("SELECT * FROM assets ORDER BY id").fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 300").fetchall()]
-        return {"incidents": incidents, "assets": assets, "search_areas": areas, "clues": clues, "timeline": timeline}
+            merges = [dict(r) for r in conn.execute("SELECT * FROM area_merges ORDER BY id").fetchall()]
+            gates = [dict(r) for r in conn.execute("SELECT * FROM area_gate_checks ORDER BY area_id,id").fetchall()]
+        gate_map: dict[int, list[dict[str, Any]]] = {}
+        for gate in gates:
+            gate["reachable"] = bool(gate["reachable"])
+            gate_map.setdefault(gate["area_id"], []).append(gate)
+        for area in areas:
+            area["gate_checks"] = gate_map.get(area["id"], [])
+        for merge in merges:
+            merge["source_area_ids"] = json.loads(merge["source_area_ids"])
+            merge["source_codes"] = json.loads(merge["source_codes"])
+        return {
+            "incidents": incidents, "assets": assets, "search_areas": areas,
+            "clues": clues, "timeline": timeline,
+            "area_merges": merges, "area_gate_checks": gates,
+        }
 
     def incident_timeline(self, incident_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -566,10 +822,18 @@ class MaritimeSARService:
         with self.connect() as conn:
             if conn.execute("SELECT COUNT(*) AS c FROM incidents").fetchone()["c"]:
                 return {"seeded": False, "reason": "已有数据"}
-        incident = self.create_incident("coord-demo", "coordinator", "SAR-2026-001", "远星号", 31.2, 122.5, 15.0, 3, "东海搜救中心", description="演示遇险事件")
+        incident = self.create_incident(
+            "coord-demo", "coordinator", "SAR-2026-001", "远星号", 31.2, 122.5, 15.0,
+            3, "东海搜救中心", drift_direction=90, drift_speed_kn=1.5, description="演示遇险事件",
+        )
         self.add_asset("coord-demo", "coordinator", "海巡01", "vessel", ["surface", "night"], 31.0, 122.0, 22.0, 180.0, 6)
         self.add_asset("coord-demo", "coordinator", "救助直升机", "aircraft", ["air", "night"], 30.8, 122.1, 180.0, 260.0, 5)
+        # 首个圈定区域 → 概率区域
         self.create_search_area("coord-demo", "coordinator", incident["id"], "AREA-A", "surface", 31.2, 122.5, 20.0, 1, "首要搜索区")
+        # 与首个概率区域重叠，保存时合并
+        self.create_search_area("coord-demo", "coordinator", incident["id"], "AREA-B", "surface", 31.25, 122.6, 25.0, 2, "东侧补搜")
+        # 漂移方向远端，超出所有水面资源航程 → 待放行
+        self.create_search_area("coord-demo", "coordinator", incident["id"], "AREA-FAR", "surface", 32.2, 124.2, 10.0, 3, "远端疑似漂流点")
         return {"seeded": True, "incident_id": incident["id"]}
 
 
